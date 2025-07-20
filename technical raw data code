@@ -1,0 +1,668 @@
+import os
+import time
+import requests
+import yfinance as yf
+import pandas as pd
+import numpy as np
+import argparse
+import matplotlib.pyplot as plt
+from ta.trend import EMAIndicator, MACD
+from ta.momentum import RSIIndicator, WilliamsRIndicator
+from ta.volatility import BollingerBands, AverageTrueRange
+from ta.volume import OnBalanceVolumeIndicator
+from transformers import pipeline
+from textblob import TextBlob
+
+DATA_CACHE_DIR = "price_data_cache"
+os.makedirs(DATA_CACHE_DIR, exist_ok=True)
+
+
+
+# === Global Configuration ===
+DATA_DAYS_DEFAULT = 180
+AGGRESSION_LEVEL_DEFAULT = 1
+DATA_DAYS_DEFAULT = 180  # or DATA_DAYS if you prefer
+NEWS_LOOKBACK_DAYS = 7
+MAX_NEWS = 7
+  # Can be set by user input
+
+# === Macro Environment Assumptions ===
+MACRO = {
+    "gdp_growth": 2.3,          # %
+    "core_inflation": 3.1,      # %
+    "fed_rate": 5.25            # %
+}
+
+def macro_favoring_growth(macro):
+    return macro["core_inflation"] < 3.5 and macro["fed_rate"] < 5.5
+    
+# --- Add this near the top, after MACRO dict ---
+
+def macro_bias_weight(macro):
+    if macro["gdp_growth"] > 2.5 and macro["core_inflation"] < 3 and macro["fed_rate"] < 5:
+        return 1.0  # Bullish macro environment
+    elif macro["fed_rate"] > 5.5 or macro["core_inflation"] > 4:
+        return -1.0  # Bearish macro pressure
+    else:
+        return 0.0  # Neutral
+
+
+# --- Replace your existing add_indicators with this (keeps your unique indicators) ---
+
+def add_indicators(df):
+    cs = df["Close"]
+    df["ema_50"] = EMAIndicator(cs, window=50).ema_indicator()
+    df["ema_200"] = EMAIndicator(cs, window=200).ema_indicator()
+    df["macd_hist"] = MACD(cs).macd_diff()
+    df["rsi"] = RSIIndicator(cs).rsi()
+    df["williams_r"] = WilliamsRIndicator(df["High"], df["Low"], cs, lbp=14).williams_r()
+    bb = BollingerBands(cs)
+    df["bb_low"] = bb.bollinger_lband()
+    df["bb_high"] = bb.bollinger_hband()
+    df["atr"] = AverageTrueRange(df["High"], df["Low"], cs).average_true_range()
+    # Unique indicators you had:
+    df["efi"] = elder_force_index(df)
+    df["chop"] = choppiness_index(df)
+    df["ulcer"] = ulcer_index(df)
+    kvo, kvo_signal = klinger_volume_oscillator(df)
+    df["kvo"] = kvo
+    df["kvo_signal"] = kvo_signal
+    vip, vin = vortex_indicator(df)
+    df["vortex_pos"] = vip
+    df["vortex_neg"] = vin
+    return df
+
+
+# --- Update signal_strength_score to integrate macro weighting ---
+
+def signal_strength_score(df, thresholds, macro_bias=False, growth_metrics=None):
+    latest = df.iloc[-1]
+    score = 0
+
+    if latest["Close"] > latest["ema_50"]:
+        score += 1
+    if latest["Close"] > latest["ema_200"]:
+        score += 1
+    if latest["macd_hist"] > thresholds["macd_thresh"]:
+        score += 1
+    if latest["rsi"] > thresholds["rsi_thresh"]:
+        score += 1
+    if latest["kvo"] > latest["kvo_signal"]:
+        score += 1
+    if latest["vortex_pos"] > latest["vortex_neg"]:
+        score += 1
+    if latest["williams_r"] < thresholds["williams_thresh"]:
+        score += 0.5
+    if latest["chop"] < 38.2:
+        score += 0.5
+
+    # Add macro environment bias weight if requested
+    if macro_bias:
+        macro_weight = macro_bias_weight(MACRO)
+        score += macro_weight
+
+    if growth_metrics:
+        peg = growth_metrics.get("pegRatio")
+        rev = growth_metrics.get("revenueGrowth")
+        if peg is not None and peg < 1.5:
+            score += 0.5
+        if rev is not None and rev > 0.15:
+            score += 0.5
+
+    return round(score, 2)
+
+
+def get_aggression_thresholds(level):
+    if level == 2:
+        return {"rsi_thresh": 45, "macd_thresh": -0.05, "williams_thresh": -70}
+    elif level == 1:
+        return {"rsi_thresh": 50, "macd_thresh": 0.0, "williams_thresh": -75}
+    else:
+        return {"rsi_thresh": 55, "macd_thresh": 0.05, "williams_thresh": -80}
+
+def is_tech_growth_stock(ticker, key):
+    try:
+        profile = requests.get(f"https://finnhub.io/api/v1/stock/profile2?symbol={ticker}&token={key}").json()
+        industry = profile.get("finnhubIndustry", "").lower()
+        return any(s in industry for s in ["tech", "software", "semiconductor", "ai", "cloud", "internet"])
+    except:
+        return False
+
+def fetch_growth_metrics(ticker, key):
+    url = f"https://finnhub.io/api/v1/stock/metric?symbol={ticker}&metric=all&token={key}"
+    try:
+        data = requests.get(url).json().get('metric', {})
+        return {
+            "peForward": data.get("peForward"),
+            "pegRatio": data.get("pegRatio"),
+            "revenueGrowth": data.get("revenueGrowth")
+        }
+    except:
+        return {}
+# === Unique Indicators ===
+
+def klinger_volume_oscillator(df, short=34, long=55, signal=13):
+    df = df.copy()
+    df['dm'] = np.where(df['Close'] - df['Close'].shift(1) > 0,
+                        df['Volume'], -df['Volume'])
+    df['kvo_short_ema'] = df['dm'].ewm(span=short, adjust=False).mean()
+    df['kvo_long_ema'] = df['dm'].ewm(span=long, adjust=False).mean()
+    df['kvo'] = df['kvo_short_ema'] - df['kvo_long_ema']
+    df['kvo_signal'] = df['kvo'].ewm(span=signal, adjust=False).mean()
+    return df['kvo'], df['kvo_signal']
+
+def vortex_indicator(df, period=14):
+    df = df.copy()
+    tr = pd.Series(np.maximum.reduce([
+        df['High'] - df['Low'],
+        abs(df['High'] - df['Close'].shift(1)),
+        abs(df['Low'] - df['Close'].shift(1))
+    ]))
+    tr_sum = tr.rolling(period).sum()
+    vmp = abs(df['High'] - df['Low'].shift(1))
+    vmm = abs(df['Low'] - df['High'].shift(1))
+    vip = vmp.rolling(period).sum() / tr_sum
+    vin = vmm.rolling(period).sum() / tr_sum
+    return vip, vin
+
+def elder_force_index(df, period=13):
+    efi_raw = (df['Close'] - df['Close'].shift(1)) * df['Volume']
+    efi = efi_raw.ewm(span=period, adjust=False).mean()
+    return efi
+
+def choppiness_index(df, period=14):
+    high = df['High']
+    low = df['Low']
+    close = df['Close']
+    atr = AverageTrueRange(high, low, close, window=1).average_true_range()
+    atr_sum = atr.rolling(period).sum()
+    max_high = high.rolling(period).max()
+    min_low = low.rolling(period).min()
+    chop = 100 * np.log10(atr_sum / (max_high - min_low)) / np.log10(period)
+    return chop
+
+def ulcer_index(df, period=14):
+    close = df['Close']
+    max_close = close.rolling(period).max()
+    drawdown = (close - max_close) / max_close * 100
+    squared = drawdown ** 2
+    ui = np.sqrt(squared.rolling(period).mean())
+    return ui
+
+
+def analyze_signal(df, thresholds, sector="tech", signal_strength_score_fn=None, earnings_data=None, news_sentiment_score=0, eps=None, eps_diluted=None, iv=None):
+    buy_score = 0
+    sell_score = 0
+    triggers_buy = []
+    triggers_sell = []
+
+    latest = df.iloc[-1]
+
+    # --- Trend & Momentum Indicators ---
+    if latest['macd_hist'] > thresholds["macd_thresh"]:
+        buy_score += 1
+        triggers_buy.append("macd_rising")
+    if latest['rsi'] > thresholds["rsi_thresh"]:
+        buy_score += 1
+        triggers_buy.append("rsi_rising")
+    if latest['williams_r'] > thresholds["williams_thresh"]:
+        sell_score += 1
+        triggers_sell.append("williams_overbought")
+    if latest['Close'] > latest['ema_50'] > latest['ema_200']:
+        buy_score += 1
+        triggers_buy.append("strong_uptrend")
+    if latest['Close'] < latest['ema_50'] < latest['ema_200']:
+        sell_score += 1
+        triggers_sell.append("strong_downtrend")
+
+    # --- Volume Confirmation ---
+    if 'Volume' in latest and 'kvo' in latest and 'kvo_signal' in latest:
+        if latest['Volume'] > df['Volume'].rolling(20).mean().iloc[-1]:
+            if latest['kvo'] > latest['kvo_signal']:
+                buy_score += 1
+                triggers_buy.append("volume_acceleration")
+            else:
+                sell_score += 1
+                triggers_sell.append("volume_fade")
+
+    # --- Candlestick Pattern Impact ---
+    if 'candle_signal' in latest:
+        if 'bullish' in latest['candle_signal']:
+            buy_score += 1
+            triggers_buy.append("bullish_candlestick")
+        if 'bearish' in latest['candle_signal']:
+            sell_score += 1
+            triggers_sell.append("bearish_candlestick")
+
+    # --- Earnings Surprise ---
+    earnings_surprise = 0
+    if earnings_data and 'Actual' in earnings_data and 'Estimate' in earnings_data:
+        earnings_surprise = earnings_data['Actual'] - earnings_data['Estimate']
+        if earnings_surprise > 0:
+            buy_score += 1
+            triggers_buy.append("positive_earnings")
+        elif earnings_surprise < 0:
+            sell_score += 1
+            triggers_sell.append("negative_earnings")
+
+    # --- EPS and Diluted EPS Analysis ---
+    if eps and eps_diluted:
+        if eps > eps_diluted:
+            buy_score += 0.5
+            triggers_buy.append("eps_improving")
+        elif eps < eps_diluted:
+            sell_score += 0.5
+            triggers_sell.append("eps_dilution")
+
+    # --- Implied Volatility (IV) ---
+    if iv:
+        if iv < 0.4:
+            buy_score += 0.5
+            triggers_buy.append("low_iv_entry")
+        elif iv > 0.7:
+            sell_score += 0.5
+            triggers_sell.append("high_iv_risk")
+
+    # --- Sector-Specific Logic ---
+    if sector == "tech":
+        if earnings_surprise > 0 and "AI" in latest.get("news_keywords", ""):
+            buy_score += 1
+            triggers_buy.append("ai_trend_tech")
+    elif sector == "energy":
+        if "renewables" in latest.get("news_keywords", ""):
+            buy_score += 1
+            triggers_buy.append("green_investment")
+        if "opec" in latest.get("news_keywords", "") and "cuts" in latest.get("news_keywords", ""):
+            sell_score += 1
+            triggers_sell.append("opec_cut_risk")
+
+    # --- News Sentiment Influence ---
+    if news_sentiment_score >= 1:
+        buy_score += 1
+        triggers_buy.append("news_positive")
+    elif news_sentiment_score <= -1:
+        sell_score += 1
+        triggers_sell.append("news_negative")
+
+    # --- Signal Strength Score Override ---
+    signal_strength_score = 0
+    if signal_strength_score_fn:
+        signal_strength_score = signal_strength_score_fn(df)
+
+    # --- Final Signal Decision ---
+    signal = "Wait"
+    reason = "Not enough aligned signals"
+
+    if buy_score >= 3 and sell_score <= 1:
+        signal = "Buy"
+        reason = f"Strong uptrend ({buy_score} buy vs {sell_score} sell triggers)"
+    elif sell_score >= 3 and buy_score <= 1:
+        signal = "Sell"
+        reason = f"Downtrend risk ({sell_score} sell vs {buy_score} buy triggers)"
+
+    # Aggressive override based on earnings/news/AI/sector catalyst
+    if sector == "tech" and earnings_surprise > 0 and "ai" in latest.get("news_keywords", "").lower():
+        signal = "Buy"
+        reason = "AI catalyst + earnings surprise in tech"
+
+    return signal, reason
+
+
+def detect_patterns(df):
+    latest, prev = df.iloc[-1], df.iloc[-2]
+    patt = []
+
+    if prev["Close"] < prev["Open"] and latest["Close"] > prev["Open"] and latest["Open"] < prev["Close"]:
+        patt.append("Bullish Engulfing")
+
+    if abs(latest["Close"] - latest["Open"]) < 0.1 * latest["atr"]:
+        patt.append("Doji")
+
+    lower_wick = latest["Open"] - latest["Low"] if latest["Open"] < latest["Close"] else latest["Close"] - latest["Low"]
+    body = abs(latest["Close"] - latest["Open"])
+    if body < 0.4 * latest["atr"] and lower_wick > 2 * body:
+        patt.append("Hammer")
+
+    upper_wick = latest["High"] - max(latest["Close"], latest["Open"])
+    if body < 0.4 * latest["atr"] and upper_wick > 2 * body:
+        patt.append("Shooting Star")
+
+    return ", ".join(patt) if patt else "None"
+
+def volume_zones(df, bins=15):
+    try:
+        df = df.copy()
+        price_range = df['Close'].max() - df['Close'].min()
+        if price_range == 0:
+            return []
+        bin_width = price_range / bins
+        df['bin'] = ((df['Close'] - df['Close'].min()) // bin_width).astype(int)
+        vol_by_bin = df.groupby('bin')['Volume'].sum()
+        top_bins = vol_by_bin.nlargest(3).index
+        zones = sorted([(df['Close'].min() + b * bin_width) for b in top_bins])
+        return [round(z, 2) for z in zones]
+    except Exception as e:
+        print(f"volume_zones error: {e}")
+        return []
+
+EVENTS = {
+    "Fed": ["fed", "federal reserve", "interest rate hike", "rate decision"],
+    "EarningsWk": ["earnings", "quarterly report", "q1", "q2", "q3", "q4"],
+    "ChinaRisk": ["china", "tariff", "export", "import", "supply chain"],
+    "GeoPolitical": ["war", "sanction", "conflict", "russia", "ukraine", "north korea"],
+    "Covid": ["covid", "pandemic", "virus", "lockdown", "vaccine"]
+}
+
+def risk_tags(headlines):
+    tags = []
+    for evt, kw_list in EVENTS.items():
+        for kw in kw_list:
+            if any(kw in h.lower() for h in headlines):
+                tags.append(evt)
+                break
+    return tags or ["None"]
+
+def fetch_news(ticker, key):
+    today = pd.Timestamp.today().date()
+    fr = today - pd.Timedelta(days=NEWS_LOOKBACK_DAYS)
+    url = f"https://finnhub.io/api/v1/company-news?symbol={ticker}&from={fr}&to={today}&token={key}"
+    try:
+        return [i["headline"] for i in requests.get(url).json()[:MAX_NEWS]]
+    except Exception as e:
+        print(f"Error fetching news: {e}")
+        return []
+
+def summarize_sentiment_llm(headlines):
+    if not headlines:
+        return "Neutral"
+    try:
+        pipe = pipeline("sentiment-analysis", model="distilbert-base-uncased-finetuned-sst-2-english")
+        res = pipe(headlines)
+        pos = sum(1 for r in res if r['label'] == "POSITIVE")
+        neg = sum(1 for r in res if r['label'] == "NEGATIVE")
+        tb_scores = [TextBlob(h).sentiment.polarity for h in headlines]
+        tb_avg = np.mean(tb_scores)
+        score = pos - neg + (tb_avg * len(headlines))
+        if score > 0.5:
+            return "Positive"
+        elif score < -0.5:
+            return "Negative"
+        else:
+            return "Neutral"
+    except Exception as e:
+        print(f"Sentiment error: {e}")
+        return "Neutral"
+
+def fetch_earnings(ticker, key):
+    try:
+        data = requests.get(f"https://finnhub.io/api/v1/stock/earnings?symbol={ticker}&token={key}").json()
+        if data:
+            l = data[0]
+            return f"Earnings: Actual={l.get('actual')}, Estimate={l.get('estimate')}, Surprise={l.get('surprise')}"
+    except:
+        pass
+    return "No earnings data available."
+
+# === Backtesting ===
+history = []
+
+def record_and_backtest(ticker, df, thresholds, window_size=20):
+    """
+    Perform backtest by scanning entire historical df for signals,
+    calculate 5-day returns after each signal, and summarize.
+    """
+    returns_buy = []
+    returns_sell = []
+
+    for i in range(window_size, len(df) - 5):  # start after enough data for indicators
+        subset = df.iloc[i - window_size + 1 : i + 1]  # pass last `window_size` rows to signal
+        sig, _ = analyze_signal(subset, thresholds)
+        if sig == "Buy":
+            future_returns = df["Close"].iloc[i+1:i+6].pct_change().dropna()
+            if not future_returns.empty:
+                cum_return = (future_returns + 1).prod() - 1
+                returns_buy.append(cum_return)
+        elif sig == "Sell":
+            future_returns = df["Close"].iloc[i+1:i+6].pct_change().dropna()
+            if not future_returns.empty:
+                cum_return = (future_returns + 1).prod() - 1
+                returns_sell.append(cum_return)
+
+    def compute_stats(returns):
+        if len(returns) == 0:
+            return None
+        avg_return = np.mean(returns)
+        std_return = np.std(returns)
+        sharpe = avg_return / std_return * np.sqrt(252) if std_return > 0 else 0
+        max_dd = max_drawdown(np.array(returns))
+        return avg_return, sharpe, max_dd
+
+    buy_stats = compute_stats(returns_buy)
+    sell_stats = compute_stats(returns_sell)
+
+    report = ""
+    if buy_stats:
+        report += (f"Buy signals: Avg 5-day return {buy_stats[0]*100:.2f}%, "
+                   f"Sharpe ~ {buy_stats[1]:.2f}, MaxDD: {buy_stats[2]*100:.2f}%\n")
+    else:
+        report += "No Buy signal backtest data.\n"
+
+    if sell_stats:
+        report += (f"Sell signals: Avg 5-day return {sell_stats[0]*100:.2f}%, "
+                   f"Sharpe ~ {sell_stats[1]:.2f}, MaxDD: {sell_stats[2]*100:.2f}%")
+    else:
+        report += "No Sell signal backtest data."
+
+    return report.strip()
+
+# Update plot_equity_curve to plot buy/sell markers on the chart for clarity
+def plot_equity_curve(df, thresholds, ticker, sp500_df=None):
+    df = df.copy()
+    window_size = 20  # must match backtest window
+
+    df['Signal'], _ = zip(*[
+        analyze_signal(df.iloc[max(0, i - window_size + 1):i + 1], thresholds) if i >= window_size - 1 else ("Wait", "")
+        for i in range(len(df))
+    ])
+
+    # Positions: 1 for Buy, -1 for Sell, 0 for Wait
+    position = 0
+    positions = []
+    for sig in df['Signal']:
+        if sig == "Buy":
+            position = 1
+        elif sig == "Sell":
+            position = -1
+        else:
+            position = 0
+        positions.append(position)
+    df['Position'] = positions
+
+    df['Returns'] = df['Close'].pct_change().fillna(0)
+    df['Strategy_Returns'] = df['Returns'] * df['Position'].shift(1).fillna(0)
+    df['Equity_Curve'] = (1 + df['Strategy_Returns']).cumprod()
+    df['Buy_Hold_Curve'] = (1 + df['Returns']).cumprod()
+
+    plt.figure(figsize=(12,6))
+    plt.plot(df.index, df['Equity_Curve'], label='Strategy Equity Curve', linewidth=2)
+    plt.plot(df.index, df['Buy_Hold_Curve'], label='Buy & Hold', alpha=0.7)
+
+    # Plot S&P 500 if given
+    if sp500_df is not None:
+        sp500_df = sp500_df.copy()
+        sp500_df['SP500_Returns'] = sp500_df['Close'].pct_change().fillna(0)
+        sp500_df['SP500_Cum'] = (1 + sp500_df['SP500_Returns']).cumprod()
+        plt.plot(sp500_df.index, sp500_df['SP500_Cum'], label='S&P 500', alpha=0.7)
+
+    # Plot Buy/Sell signals as markers
+    buy_dates = df.index[df['Signal'] == 'Buy']
+    sell_dates = df.index[df['Signal'] == 'Sell']
+    plt.scatter(buy_dates, df.loc[buy_dates, 'Close'], marker='^', color='green', label='Buy Signal', s=100)
+    plt.scatter(sell_dates, df.loc[sell_dates, 'Close'], marker='v', color='red', label='Sell Signal', s=100)
+
+    plt.title(f"Equity Curve Comparison for {ticker}")
+    plt.xlabel("Date")
+    plt.ylabel("Cumulative Returns")
+    plt.legend()
+    plt.grid(True)
+    plt.tight_layout()
+    plt.show()
+
+def max_drawdown(returns):
+    wealth_index = np.cumprod(1 + returns)
+    peak = np.maximum.accumulate(wealth_index)
+    drawdowns = (wealth_index - peak) / peak
+    return abs(drawdowns.min())
+    
+def get_valid_api_key():
+    key = os.getenv("FINNHUB_API_KEY")
+    if not key:
+        key = input("Enter your Finnhub API key: ").strip()
+    return key
+
+
+def get_price_data(ticker, period=180, interval="1d", max_retries=3, use_cache=True):
+    """
+    Fetch price data for a ticker using yfinance with retries and optional caching.
+    
+    Args:
+        ticker (str): Stock ticker symbol.
+        period (int): Number of days to fetch.
+        interval (str): Data interval (default "1d").
+        max_retries (int): How many times to retry on failure.
+        use_cache (bool): Whether to cache data locally to avoid repeated downloads.
+
+    Returns:
+        pd.DataFrame: DataFrame with columns Close, Open, High, Low, Volume.
+    """
+    cache_file = os.path.join(DATA_CACHE_DIR, f"{ticker}_{period}d_{interval}.csv")
+    
+    if use_cache and os.path.isfile(cache_file):
+        print(f"Loading cached data for {ticker} from {cache_file}")
+        df = pd.read_csv(cache_file, index_col=0, parse_dates=True)
+        return df
+    
+    attempt = 0
+    while attempt < max_retries:
+        try:
+            print(f"Downloading {ticker} data (attempt {attempt+1}/{max_retries})...")
+            df = yf.download(ticker, period=f"{period}d", interval=interval, auto_adjust=True, progress=False)
+            if df.empty:
+                raise ValueError(f"No data returned for ticker {ticker}")
+            if isinstance(df.columns, pd.MultiIndex):
+                df.columns = df.columns.get_level_values(0)
+            df = df[['Close', 'Open', 'High', 'Low', 'Volume']]
+            df.dropna(inplace=True)
+            
+            if use_cache:
+                df.to_csv(cache_file)
+                print(f"Cached data saved to {cache_file}")
+            
+            return df
+        except Exception as e:
+            print(f"Error downloading data for {ticker}: {e}")
+            attempt += 1
+            time.sleep(2)  # wait before retrying
+    
+    raise RuntimeError(f"Failed to fetch data for {ticker} after {max_retries} attempts.")
+
+def main():
+    parser = argparse.ArgumentParser(description="Stock signal analyzer")
+    parser.add_argument("--tickers", type=str, help="Comma separated tickers e.g. AAPL,TSLA", required=False)
+    parser.add_argument("--days", type=int, default=DATA_DAYS_DEFAULT, help="Number of days for price data")
+    parser.add_argument("--aggression", type=int, choices=[0,1,2], default=AGGRESSION_LEVEL_DEFAULT, help="Aggression level for thresholds")
+    args = parser.parse_args()
+
+    os.environ["TRANSFORMERS_CACHE"] = os.getcwd() + "/hf_cache"
+    FINNHUB = get_valid_api_key()
+
+    if args.tickers:
+        TICKERS = [t.strip().upper() for t in args.tickers.split(",")]
+    else:
+        TICKERS = [t.strip().upper() for t in input("Tickers (e.g. AAPL,TSLA): ").split(",")]
+
+    thresholds = get_aggression_thresholds(args.aggression)
+
+    results = []
+
+    for tk in TICKERS:
+        print(f"\nProcessing {tk}...")
+        df = get_price_data(tk, period=args.days)
+
+        print(f"\nRaw data for {tk}:")
+        print(df.tail())
+        print(f"Data after dropping NaN and selecting columns: {df.shape}\n")
+
+        print("Device set to use cpu\n")
+
+        df = add_indicators(df)
+
+        sector = "tech" if is_tech_growth_stock(tk, FINNHUB) else "energy" if "energy" in tk.lower() else "general"
+        sig, reason = analyze_signal(df, thresholds, sector=sector)
+
+        signal_strength = signal_strength_score(df, thresholds)
+
+        news = fetch_news(tk, FINNHUB)
+        sent = summarize_sentiment_llm(news)
+        earn = fetch_earnings(tk, FINNHUB)
+
+        patt = detect_patterns(df)
+        zones = volume_zones(df)
+        back = record_and_backtest(tk, df, thresholds, window_size=20)
+        tags = risk_tags(news)
+
+        print(f"Signal: {sig} | {reason}")
+        print(f"Signal Strength Score: {signal_strength}/7")
+        print(f"News Sentiment: {sent}")
+        print(f"Earnings: {earn}")
+        print(f"Candlestick Pattern(s): {patt}")
+        print(f"Volume Zones (Support/Resistance): {zones}")
+        print(f"Backtest Insight:\n{back}")
+        print(f"Risk Context Tags: {tags}\n")
+
+        print("Recent News Headlines:")
+        if news:
+            for headline in news:
+                print(f"  - {headline}")
+        else:
+            print("  No recent news found.")
+
+        print("\n" + "-"*50 + "\n")
+
+        results.append({
+            "ticker": tk,
+            "signal": sig,
+            "reason": reason,
+            "signal_strength": signal_strength,
+            "news_sentiment": sent,
+            "earnings": earn,
+            "candlestick_patterns": patt,
+            "volume_zones": zones,
+            "backtest": back,
+            "risk_tags": tags,
+            "news": news,
+            "df": df
+        })
+
+        # === NEW: Plot equity curve per ticker ===
+        plot_equity_curve(df, thresholds, tk)
+
+        time.sleep(1)
+
+    print("Summary of signals:\n")
+    for r in results:
+        print(f"{r['ticker']}: Signal = {r['signal']}")
+        print(f"Model/Reason: {r['reason']}")
+        print(f"News Sentiment: {r['news_sentiment']}")
+        print(f"Earnings: {r['earnings']}")
+        print("Recent News Headlines:")
+        if r['news']:
+            for h in r['news']:
+                print(f"  - {h}")
+        else:
+            print("  No recent news found.")
+        print("-" * 50)
+
+
+if __name__ == "__main__":
+    main()
