@@ -28,9 +28,9 @@ MAX_NEWS = 7
 
 # === Macro Environment Assumptions ===
 MACRO = {
-    "gdp_growth": 2.3,          # %
-    "core_inflation": 3.1,      # %
-    "fed_rate": 5.25            # %
+    "gdp_growth": 2,          # %
+    "core_inflation": 2.1,      # %
+    "fed_rate": 3.5            # %
 }
 
 def macro_favoring_growth(macro):
