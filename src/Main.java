@@ -5,8 +5,11 @@ import java.util.ArrayList;
 import java.util.Collections;
 
 import javafx.application.Application;
+import javafx.fxml.FXMLLoader;
+import javafx.scene.Parent;
 import javafx.scene.Scene;
 import javafx.scene.control.Button;
+import javafx.scene.layout.Pane;
 import javafx.scene.layout.StackPane;
 import javafx.stage.Stage;
 
@@ -14,6 +17,7 @@ public class Main extends Application{
     public static void main(String[] args) throws IOException {
         BufferedReader reader = new BufferedReader(new FileReader("libs/SPY.csv"));
         ArrayList<Entry> data = new ArrayList<>();
+        Boolean ready = false;
 
         // 1) Skip header
         reader.readLine();
@@ -64,19 +68,24 @@ public class Main extends Application{
             System.out.println(e);
         }
 
-        launch(args);
-
-
-
-        
+        if(ready){
+            launch(args);
+        }
     }
 
     @Override
     public void start(Stage stage) throws Exception {
-        Button b = new Button("Click Me");
-        b.setOnAction(e -> System.out.println("JavaFX is working!"));
-        stage.setScene(new Scene(new StackPane(b), 320, 200));
-        stage.setTitle("JavaFX Test");
+        FXMLLoader loader = new FXMLLoader(getClass().getResource("/scene1.fxml"));
+        Parent root = loader.load();
+
+        Controller controller = loader.load();
+        Scene scene = new Scene(root, 400, 300);
+
+        scene.getStylesheets().add(getClass().getResource("/style.css").toExternalForm());
+
+        stage.setTitle("visual");
+        stage.setScene(scene);
         stage.show();
+
     }
 }
