@@ -4,7 +4,13 @@ import java.io.IOException;
 import java.util.ArrayList;
 import java.util.Collections;
 
-public class Main {
+import javafx.application.Application;
+import javafx.scene.Scene;
+import javafx.scene.control.Button;
+import javafx.scene.layout.StackPane;
+import javafx.stage.Stage;
+
+public class Main extends Application{
     public static void main(String[] args) throws IOException {
         BufferedReader reader = new BufferedReader(new FileReader("libs/SPY.csv"));
         ArrayList<Entry> data = new ArrayList<>();
@@ -58,6 +64,19 @@ public class Main {
             System.out.println(e);
         }
 
+        launch(args);
+
+
+
         
+    }
+
+    @Override
+    public void start(Stage stage) throws Exception {
+        Button b = new Button("Click Me");
+        b.setOnAction(e -> System.out.println("JavaFX is working!"));
+        stage.setScene(new Scene(new StackPane(b), 320, 200));
+        stage.setTitle("JavaFX Test");
+        stage.show();
     }
 }
